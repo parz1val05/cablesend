@@ -27,6 +27,8 @@ jobs:
           flutter create --platforms=android,windows --project-name cablesend_app --org com.cablesend .
           # flutter create умеет затирать свои шаблонные файлы - возвращаем наши
           git checkout -- lib pubspec.yaml analysis_options.yaml README.md
+          # шаблонный тест flutter create ссылается на несуществующий MyApp
+          rm -f test/widget_test.dart
 
       - name: flutter pub get
         working-directory: app
@@ -60,6 +62,8 @@ jobs:
         run: |
           flutter create --platforms=android --project-name cablesend_app --org com.cablesend .
           git checkout -- lib pubspec.yaml analysis_options.yaml README.md
+          # шаблонный тест flutter create ссылается на несуществующий MyApp
+          rm -f test/widget_test.dart
 
       - name: Собрать ядро под Android (libcablesend.so)
         env:
@@ -104,6 +108,8 @@ jobs:
         run: |
           flutter create --platforms=windows --project-name cablesend_app --org com.cablesend .
           git checkout -- lib pubspec.yaml analysis_options.yaml README.md
+          # шаблонный тест flutter create ссылается на несуществующий MyApp
+          Remove-Item test/widget_test.dart -Force -ErrorAction SilentlyContinue
 
       - name: flutter pub get
         working-directory: app
