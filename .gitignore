@@ -11,3 +11,4 @@
 /app/.dart_tool/
 /app/.flutter-plugins*
 /app/pubspec.lock
+/apk/
