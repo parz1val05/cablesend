@@ -1,0 +1,13 @@
+# Rust
+/target/
+# Flutter: папки платформ создаёт CI (flutter create), в репозитории их нет
+/app/android/
+/app/ios/
+/app/windows/
+/app/macos/
+/app/linux/
+/app/web/
+/app/build/
+/app/.dart_tool/
+/app/.flutter-plugins*
+/app/pubspec.lock

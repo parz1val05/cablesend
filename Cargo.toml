@@ -1,0 +1,12 @@
+[package]
+name = "cablesend"
+version = "0.1.0"
+edition = "2021"
+description = "Cable-first LocalSend-like file transfer core: Ethernet/Thunderbolt (IP), ADB, usbmuxd"
+
+[lib]
+name = "cablesend"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# Intentionally none: prototype uses std only. See ARCHITECTURE.md for the production crate list.
