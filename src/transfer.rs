@@ -3,8 +3,44 @@ use crate::sha256::Sha256;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 const CHUNK: usize = 256 * 1024;
+/// Chunks in flight between the network thread and the disk+hash thread. Lets the
+/// cable, the disk and SHA-256 work at the same time instead of taking turns.
+const PIPELINE: usize = 4;
+/// Room left on the receiver's disk beyond the files themselves.
+const SPACE_MARGIN: u64 = 16 * 1024 * 1024;
+
+/// A file to send: already open, so a file handed over as a descriptor (Android
+/// content URIs, see `ffi::cs_send`) is sent exactly like one opened by path.
+pub struct Source {
+    pub file: File,
+    pub name: String,
+    pub size: u64,
+}
+
+impl Source {
+    pub fn open(path: &Path) -> io::Result<Source> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let file = File::open(path)?;
+        Source::from_file(file, &name).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+    }
+
+    pub fn from_file(file: File, name: &str) -> io::Result<Source> {
+        let md = file.metadata()?;
+        if !md.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a file: {name}"))); }
+        Ok(Source { file, name: clean_field(name), size: md.len() })
+    }
+}
+
+pub fn human_size(n: u64) -> String {
+    let u = ["B", "KB", "MB", "GB", "TB"];
+    let mut f = n as f64;
+    let mut i = 0;
+    while f >= 1024.0 && i < 4 { f /= 1024.0; i += 1; }
+    format!("{:.1} {}", f, u[i])
+}
 
 /// Errors that just mean "the other side went away" (also what a liveness probe looks like).
 pub fn is_disconnect(kind: io::ErrorKind) -> bool {
@@ -83,43 +119,91 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// Sender side. Returns number of files sent, or Err (incl. rejection).
 pub fn send_files<S: Read + Write>(s: &mut S, my_name: &str, files: &[PathBuf],
                                    progress: &mut dyn FnMut(&str, u64, u64)) -> io::Result<usize> {
+    let sources = files.iter().map(|p| Source::open(p)).collect::<io::Result<Vec<_>>>()?;
+    send_sources(s, my_name, sources, progress)
+}
+
+/// Sender side for files that are already open.
+pub fn send_sources<S: Read + Write>(s: &mut S, my_name: &str, sources: Vec<Source>,
+                                     progress: &mut dyn FnMut(&str, u64, u64)) -> io::Result<usize> {
     let peer = hello(s, my_name)?;
-    let mut metas = Vec::new();
-    for p in files {
-        let md = fs::metadata(p)?;
-        if !md.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a file: {}", p.display()))); }
-        let name = clean_field(&p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-        metas.push((p.clone(), name, md.len()));
-    }
-    write_frame(s, &["OFFER", &metas.len().to_string()])?;
-    for (_, name, size) in &metas {
-        write_frame(s, &["FILE", &size.to_string(), name])?;
+    write_frame(s, &["OFFER", &sources.len().to_string()])?;
+    for src in &sources {
+        write_frame(s, &["FILE", &src.size.to_string(), &src.name])?;
     }
     let ans = read_frame(s)?;
     if ans[0] != "ACCEPT" {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} rejected the transfer", peer.name)));
+        // A receiver may say why (no space, unusable folder); a person declining says nothing.
+        let msg = match ans.get(1).filter(|r| !r.is_empty()) {
+            Some(reason) => format!("{} rejected the transfer: {reason}", peer.name),
+            None => format!("{} rejected the transfer", peer.name),
+        };
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
     }
-    let mut buf = vec![0u8; CHUNK];
-    for (path, name, size) in &metas {
-        let mut f = File::open(path)?;
-        let mut hash = Sha256::new();
-        let mut sent = 0u64;
-        while sent < *size {
-            let want = ((*size - sent) as usize).min(CHUNK);
-            let n = f.read(&mut buf[..want])?;
-            if n == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank while sending")); }
-            hash.update(&buf[..n]);
-            s.write_all(&buf[..n])?;
-            sent += n as u64;
-            progress(name, sent, *size);
-        }
-        write_frame(s, &["END", &hash.finish_hex()])?;
+    let n = sources.len();
+    for mut src in sources {
+        let hash = stream_out(s, &mut src, progress)?;
+        write_frame(s, &["END", &hash])?;
         let r = read_frame(s)?;
         if r[0] != "OK" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("receiver error for {name}: {}", r.get(1).cloned().unwrap_or_default())));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("receiver error for {}: {}", src.name, r.get(1).cloned().unwrap_or_default())));
         }
     }
-    Ok(metas.len())
+    Ok(n)
+}
+
+/// Sends one file's bytes. A helper thread reads the disk and hashes while this
+/// thread writes to the cable. Returns the SHA-256 of what was sent.
+fn stream_out<S: Write>(s: &mut S, src: &mut Source, progress: &mut dyn FnMut(&str, u64, u64)) -> io::Result<String> {
+    let size = src.size;
+    let (name, file) = (&src.name, &mut src.file);
+    std::thread::scope(|sc| {
+        let (full_tx, full_rx) = mpsc::sync_channel::<io::Result<(Vec<u8>, usize)>>(PIPELINE);
+        let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..PIPELINE + 1 { let _ = free_tx.send(vec![0u8; CHUNK]); }
+
+        let reader = sc.spawn(move || -> Option<String> {
+            let mut hash = Sha256::new();
+            let mut left = size;
+            while left > 0 {
+                // The writer hangs up on error: then there is nothing left to do.
+                let mut buf = free_rx.recv().ok()?;
+                let want = (left as usize).min(CHUNK);
+                let item = loop {
+                    match file.read(&mut buf[..want]) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => break Err(e),
+                        Ok(0) => break Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank while sending")),
+                        Ok(n) => {
+                            hash.update(&buf[..n]);
+                            left -= n as u64;
+                            break Ok((buf, n));
+                        }
+                    }
+                };
+                let failed = item.is_err();
+                full_tx.send(item).ok()?;
+                if failed { return None; }
+            }
+            Some(hash.finish_hex())
+        });
+
+        let mut sent = 0u64;
+        while sent < size {
+            let (buf, n) = match full_rx.recv() {
+                Ok(item) => item?,
+                Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "file reader stopped")),
+            };
+            s.write_all(&buf[..n])?;
+            sent += n as u64;
+            progress(name, sent, size);
+            let _ = free_tx.send(buf);
+        }
+        drop(free_tx);
+        reader.join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "file reader crashed"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "file reader stopped"))
+    })
 }
 
 /// Receiver side. `accept` decides on the offer (name, size list). Returns saved paths.
@@ -140,8 +224,18 @@ pub fn receive_files<S: Read + Write>(s: &mut S, my_name: &str, dir: &Path,
     }
     // Prepared before asking, so a bad save folder is reported instead of failing mid-transfer.
     if let Err(e) = fs::create_dir_all(dir) {
-        write_frame(s, &["REJECT"])?;
+        write_frame(s, &["REJECT", "cannot use the save folder"])?;
         return Err(io::Error::new(e.kind(), format!("cannot use save folder {}: {e}", dir.display())));
+    }
+    // Checked before anyone is asked: a transfer that cannot fit would only fail
+    // half-way, after the cable was busy for minutes.
+    let total: u64 = offers.iter().map(|(_, sz)| *sz).sum();
+    if let Some(free) = crate::fsinfo::available_space(dir) {
+        if total.saturating_add(SPACE_MARGIN) > free {
+            let reason = format!("not enough space: need {}, free {}", human_size(total), human_size(free));
+            write_frame(s, &["REJECT", &reason])?;
+            return Err(io::Error::new(io::ErrorKind::Other, format!("{} wanted to send {}: {reason}", peer.name, human_size(total))));
+        }
     }
     if !accept(&peer, &offers) {
         write_frame(s, &["REJECT"])?;
@@ -149,26 +243,17 @@ pub fn receive_files<S: Read + Write>(s: &mut S, my_name: &str, dir: &Path,
     }
     write_frame(s, &["ACCEPT"])?;
     let mut saved = Vec::new();
-    let mut buf = vec![0u8; CHUNK];
     for (name, size) in &offers {
         let path = unique_path(dir, name);
         let tmp = part_path(&path);
-        let mut out = File::create(&tmp)?;
-        let mut hash = Sha256::new();
-        let mut got = 0u64;
-        while got < *size {
-            let want = ((*size - got) as usize).min(CHUNK);
-            s.read_exact(&mut buf[..want])?;
-            hash.update(&buf[..want]);
-            out.write_all(&buf[..want])?;
-            got += want as u64;
-            progress(name, got, *size);
-        }
-        out.flush()?;
-        drop(out);
+        let out = File::create(&tmp)?;
+        let got_hash = match stream_in(s, out, name, *size, progress) {
+            Ok(h) => h,
+            Err(e) => { let _ = fs::remove_file(&tmp); return Err(e); }
+        };
         let end = read_frame(s)?;
         let want_hash = end.get(1).cloned().unwrap_or_default();
-        if end[0] != "END" || want_hash != hash.finish_hex() {
+        if end[0] != "END" || want_hash != got_hash {
             let _ = fs::remove_file(&tmp);
             write_frame(s, &["ERR", "checksum mismatch"])?;
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("checksum mismatch for {name}")));
@@ -178,6 +263,48 @@ pub fn receive_files<S: Read + Write>(s: &mut S, my_name: &str, dir: &Path,
         saved.push(path);
     }
     Ok(saved)
+}
+
+/// Receives one file's bytes into `out`. This thread reads the cable while a helper
+/// thread hashes and writes to disk. Returns the SHA-256 of what was received.
+fn stream_in<S: Read>(s: &mut S, mut out: File, name: &str, size: u64,
+                      progress: &mut dyn FnMut(&str, u64, u64)) -> io::Result<String> {
+    std::thread::scope(|sc| {
+        let (full_tx, full_rx) = mpsc::sync_channel::<(Vec<u8>, usize)>(PIPELINE);
+        let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..PIPELINE + 1 { let _ = free_tx.send(vec![0u8; CHUNK]); }
+
+        let writer = sc.spawn(move || -> io::Result<String> {
+            let mut hash = Sha256::new();
+            for (buf, n) in full_rx {
+                hash.update(&buf[..n]);
+                out.write_all(&buf[..n])?;
+                let _ = free_tx.send(buf);
+            }
+            out.flush()?;
+            Ok(hash.finish_hex())
+        });
+
+        let net: io::Result<()> = (|| {
+            let mut got = 0u64;
+            while got < size {
+                // The writer hangs up when the disk fails; its own error is reported below.
+                let Ok(mut buf) = free_rx.recv() else { return Ok(()) };
+                let want = ((size - got) as usize).min(CHUNK);
+                s.read_exact(&mut buf[..want])?;
+                got += want as u64;
+                if full_tx.send((buf, want)).is_err() { return Ok(()); }
+                progress(name, got, size);
+            }
+            Ok(())
+        })();
+        drop(full_tx);
+        let disk = writer.join().map_err(|_| io::Error::new(io::ErrorKind::Other, "file writer crashed"))?;
+        // A disk error explains a stopped network loop, so it wins; otherwise report the cable.
+        let hash = disk?;
+        net?;
+        Ok(hash)
+    })
 }
 
 #[cfg(test)]
@@ -218,12 +345,39 @@ mod tests {
     }
 
     #[test]
+    fn offer_too_big_for_the_disk_is_refused_with_a_reason() {
+        if crate::fsinfo::available_space(&std::env::temp_dir()).is_none() { return; } // no check on this OS
+        let dir = std::env::temp_dir().join(format!("cs-space-{}", std::process::id()));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let dir2 = dir.clone();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut asked = false;
+            let r = receive_files(&mut s, "rx", &dir2, &mut |_, _| { asked = true; true }, &mut |_, _, _| {});
+            (r.map(|v| v.len()).map_err(|e| e.to_string()), asked)
+        });
+        // a sender offering 1 EiB, spoken by hand so no such file has to exist
+        let mut c = TcpStream::connect(addr).unwrap();
+        hello(&mut c, "tx").unwrap();
+        write_frame(&mut c, &["OFFER", "1"]).unwrap();
+        write_frame(&mut c, &["FILE", &(1u64 << 60).to_string(), "huge.bin"]).unwrap();
+        let ans = read_frame(&mut c).unwrap();
+        assert_eq!(ans[0], "REJECT");
+        assert!(ans.get(1).is_some_and(|r| r.contains("not enough space")), "{ans:?}");
+        let (res, asked) = t.join().unwrap();
+        assert!(res.unwrap_err().contains("not enough space"));
+        assert!(!asked, "the person must not be asked about a transfer that cannot fit");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn loopback_roundtrip() {
         let base = std::env::temp_dir().join(format!("cablesend-test-{}", std::process::id()));
         let src = base.join("src"); let dst = base.join("dst");
         fs::create_dir_all(&src).unwrap();
         let a = src.join("a.bin"); let b = src.join("empty.txt");
-        let data: Vec<u8> = (0..1_000_003u32).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..3_000_007u32).map(|i| (i % 251) as u8).collect();
         fs::write(&a, &data).unwrap(); fs::write(&b, b"").unwrap();
 
         let l = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -4,10 +4,12 @@ import 'dart:io' show FileStat, FileSystemEntityType;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MissingPluginException;
 
 import '../controller.dart';
 import '../format.dart';
 import '../models.dart';
+import '../platform/android_files.dart';
 import '../widgets/common.dart';
 
 class SendPage extends StatefulWidget {
@@ -32,6 +34,15 @@ class _SendPageState extends State<SendPage> {
   }
 
   Future<void> _pick() async {
+    if (AndroidFiles.supported) {
+      try {
+        final picked = await AndroidFiles.pick();
+        if (picked != null) c.addFiles(picked);
+        return;
+      } on MissingPluginException {
+        // Android part not installed: fall back to file_picker, which copies files first
+      }
+    }
     final r = await FilePicker.platform.pickFiles(allowMultiple: true);
     if (r == null) return;
     c.addFiles([

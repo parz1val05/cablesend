@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod ffi;
+pub mod fsinfo;
 pub mod json;
 pub mod proto;
 pub mod sha256;

@@ -3,16 +3,31 @@ package __PKG__
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.io.IOException
 
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         // phone <-> phone over a USB cable; runs for the whole process, not only while receiving
         UsbBridge.start(applicationContext)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cablesend/files")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "pick" -> pick(result)
+                    "open" -> {
+                        val uris = call.argument<List<String>>("uris") ?: emptyList()
+                        background(result) { uris.map { openForSend(it) } }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cablesend/service")
             .setMethodCallHandler { call, result ->
                 val text = call.argument<String>("text") ?: "Приём файлов включён"
@@ -36,6 +51,90 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    // ------------------------------------------------------------ picking files to send
+    //
+    // The system document picker instead of file_picker: file_picker copies every picked
+    // file into the app cache before handing back a path, which for a 10 GB video means
+    // minutes of waiting and 10 GB of extra space. Here the picked documents are opened
+    // in place and the core gets the descriptors (see `cs_send` in src/ffi.rs).
+
+    private var pickResult: MethodChannel.Result? = null
+
+    private fun pick(result: MethodChannel.Result) {
+        if (pickResult != null) { result.error("busy", "the picker is already open", null); return }
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        try {
+            pickResult = result
+            @Suppress("DEPRECATION")
+            startActivityForResult(i, PICK_REQUEST)
+        } catch (e: Exception) {
+            pickResult = null
+            result.error("no_picker", e.toString(), null)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode != PICK_REQUEST) {
+            @Suppress("DEPRECATION")
+            super.onActivityResult(requestCode, resultCode, data)
+            return
+        }
+        val r = pickResult ?: return
+        pickResult = null
+        if (resultCode != RESULT_OK || data == null) { r.success(null); return }
+        val uris = mutableListOf<Uri>()
+        val clip = data.clipData
+        if (clip != null) for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
+        else data.data?.let { uris.add(it) }
+        background(r) { uris.map { describe(it) } }
+    }
+
+    /** Display name and size of a picked document; size is -1 when the provider does not know it. */
+    private fun describe(u: Uri): Map<String, Any> {
+        var name = u.lastPathSegment ?: "file"
+        var size = -1L
+        contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                c.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 && !c.isNull(it) }?.let { name = c.getString(it) }
+                c.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 && !c.isNull(it) }?.let { size = c.getLong(it) }
+            }
+        }
+        return mapOf("uri" to u.toString(), "name" to name, "size" to size)
+    }
+
+    /**
+     * A picked document as one line of the core's file list: `fd:N<TAB>name` for anything
+     * backed by a real file (the descriptor is handed over to the core, which closes it),
+     * or a cache copy's path for streams without a size, like documents in cloud storage.
+     */
+    private fun openForSend(uri: String): String {
+        val u = Uri.parse(uri)
+        val name = (describe(u)["name"] as String).replace('\t', ' ').replace('\n', ' ')
+        val pfd = contentResolver.openFileDescriptor(u, "r") ?: throw IOException("cannot open $name")
+        if (pfd.statSize >= 0) return "fd:${pfd.detachFd()}\t$name"
+        pfd.close()
+        val dir = File(cacheDir, "send").apply { mkdirs() }
+        val copy = File(dir, name)
+        contentResolver.openInputStream(u)?.use { inp -> copy.outputStream().use { inp.copyTo(it, 1 shl 20) } }
+            ?: throw IOException("cannot read $name")
+        return "${copy.absolutePath}\t$name"
+    }
+
+    /** Runs slow provider calls off the UI thread and answers Dart on it. */
+    private fun background(result: MethodChannel.Result, work: () -> Any?) {
+        Thread {
+            try {
+                val v = work()
+                runOnUiThread { result.success(v) }
+            } catch (e: Exception) {
+                runOnUiThread { result.error("io", e.message ?: e.toString(), null) }
+            }
+        }.start()
+    }
+
     // The other phone switched us into accessory mode and the system opened the app for it.
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -53,5 +152,9 @@ class MainActivity : FlutterActivity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+    }
+
+    private companion object {
+        const val PICK_REQUEST = 4711
     }
 }

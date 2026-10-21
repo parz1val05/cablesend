@@ -6,6 +6,7 @@ import 'dart:io';
 import 'package:ffi/ffi.dart';
 
 import '../models.dart';
+import '../platform/android_files.dart';
 import 'backend.dart';
 import 'event_parser.dart';
 
@@ -181,9 +182,18 @@ class FfiBackend implements Backend {
 
   @override
   Future<void> send({required Peer peer, required List<String> paths, required String name}) async {
+    // Documents picked on Android are content:// URIs: hand them to the core as open
+    // descriptors, so nothing is copied first (AndroidFiles.openForSend).
+    final uris = [for (final p in paths) if (AndroidFiles.isContentUri(p)) p];
+    final opened = uris.isEmpty ? const <String>[] : await AndroidFiles.openForSend(uris);
+    final lines = <String>[];
+    var k = 0;
+    for (final p in paths) {
+      lines.add(AndroidFiles.isContentUri(p) ? opened[k++] : p);
+    }
     final to = peer.address.toNativeUtf8();
     final n = name.toNativeUtf8();
-    final f = paths.join('\n').toNativeUtf8();
+    final f = lines.join('\n').toNativeUtf8();
     try {
       _send(to, n, f); // returns at once; progress and result arrive as events
     } finally {

@@ -199,15 +199,48 @@ pub extern "C" fn cs_answer(accept: i32) {
     if let Some(tx) = lock(&eng().answer).take() { let _ = tx.send(accept != 0); }
 }
 
-/// Send files to `to` ("host:port"). `files` is a newline-separated list of absolute paths.
+/// One line of `cs_send`'s file list: `path`, or `fd:N<TAB>display name`.
+///
+/// Android hands over files picked from the system picker as open descriptors
+/// (`ParcelFileDescriptor.detachFd`), so a 10 GB video is read in place instead of
+/// first being copied into the app's cache. The descriptor is owned from here on.
+fn open_source(line: &str) -> std::io::Result<transfer::Source> {
+    let (src, shown) = match line.split_once('\t') {
+        Some((s, n)) => (s, Some(n)),
+        None => (line, None),
+    };
+    if let Some(fd) = src.strip_prefix("fd:") {
+        let fd: i32 = fd.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad descriptor: {src}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the app detached this descriptor for us and never touches it again.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            return transfer::Source::from_file(file, shown.unwrap_or("file"));
+        }
+        #[cfg(not(unix))]
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("descriptors are not supported here: {fd}")));
+    }
+    let path = PathBuf::from(src);
+    match shown {
+        Some(n) => transfer::Source::from_file(std::fs::File::open(&path)?, n),
+        None => transfer::Source::open(&path),
+    }
+}
+
+/// Send files to `to` ("host:port"). `files` is a newline-separated list; each line is
+/// an absolute path or `fd:N<TAB>name` (see `open_source`).
 #[no_mangle]
 pub unsafe extern "C" fn cs_send(to: *const c_char, name: *const c_char, files: *const c_char) {
     let (to, name, files) = (cstr(to), cstr(name), cstr(files));
     spawn_guarded("out", move || {
-        let paths: Vec<PathBuf> = files.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect();
-        let result = transport::connect_tcp(&to).and_then(|mut s| {
+        // Every line is opened before connecting, so each passed descriptor is owned
+        // (and closed) even when the connection then fails.
+        let opened: Vec<std::io::Result<transfer::Source>> = files.lines().filter(|l| !l.is_empty()).map(open_source).collect();
+        let result = opened.into_iter().collect::<std::io::Result<Vec<_>>>().and_then(|sources| {
+            let mut s = transport::connect_tcp(&to)?;
             let mut sink = progress_sink("out");
-            transfer::send_files(&mut s, &name, &paths, &mut sink)
+            transfer::send_sources(&mut s, &name, sources, &mut sink)
         });
         match result {
             Ok(n) => push(format!("{{\"event\":\"done\",\"dir\":\"out\",\"files\":{n}}}")),

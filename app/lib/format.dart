@@ -24,6 +24,22 @@ String pluralFiles(int n) {
 /// shown to the person as-is, in English.
 String friendlyError(String raw) {
   final m = raw.toLowerCase();
+  // "not enough space: need 4.2 GB, free 1.1 GB" from the receiver's disk check
+  final space = RegExp(r'not enough space: need ([\d.]+ \w+), free ([\d.]+ \w+)').firstMatch(raw);
+  if (space != null) {
+    String ru(String s) => s
+        .replaceAll('.', ',')
+        .replaceAll('TB', 'ТБ')
+        .replaceAll('GB', 'ГБ')
+        .replaceAll('MB', 'МБ')
+        .replaceAll('KB', 'КБ')
+        .replaceAll(RegExp(r'B$'), 'Б');
+    final need = ru(space.group(1)!);
+    final free = ru(space.group(2)!);
+    return m.contains('rejected')
+        ? 'На получателе не хватает места: нужно $need, свободно $free. Освободите место и повторите.'
+        : 'Не хватает места для приёма: нужно $need, свободно $free. Передача отклонена.';
+  }
   if (m.contains('rejected')) return 'Получатель отклонил передачу.';
   if (m.contains('protocol version mismatch')) {
     return 'На устройствах разные версии CableSend. Обновите приложение на обоих.';
