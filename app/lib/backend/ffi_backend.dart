@@ -117,15 +117,13 @@ class FfiBackend implements Backend {
         id: id == null || id.isEmpty ? '${usb ? 'usb' : 'net'}:$addr' : 'dev:$id',
         name: m['name'] as String? ?? 'Устройство',
         platform: platform,
-        // The kind follows what the peer *is*, not how we reach it: over USB this
-        // is normally the computer the phone is plugged into.
+        // Over USB a phone reaches either the computer it is plugged into (adb reverse)
+        // or another phone (the AOA bridge); the core tells them apart by id.
         kind: !usb
             ? CableKind.network
-            : switch (platform) {
-                'android' => CableKind.android,
-                'ios' => CableKind.ios,
-                _ => CableKind.usbHost,
-              },
+            : id == 'usb-phone'
+                ? CableKind.usbPhone
+                : CableKind.usbHost,
         address: addr,
       ));
     }

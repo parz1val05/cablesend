@@ -31,7 +31,8 @@ dest_dir = os.path.dirname(found)
 if found.endswith(".java"):
     os.rename(found, found + ".bak")
     found = os.path.join(dest_dir, "MainActivity.kt")
-for name, out in (("ReceiveService.kt.tmpl", "ReceiveService.kt"), ("MainActivity.kt.tmpl", "MainActivity.kt")):
+for name, out in (("ReceiveService.kt.tmpl", "ReceiveService.kt"), ("MainActivity.kt.tmpl", "MainActivity.kt"),
+                  ("UsbBridge.kt.tmpl", "UsbBridge.kt")):
     text = open(os.path.join(tmpl, name), encoding="utf-8").read().replace("__PKG__", pkg)
     open(os.path.join(dest_dir, out), "w", encoding="utf-8").write(text)
 
@@ -50,6 +51,28 @@ if add:
 svc = f'<service android:name="{pkg}.ReceiveService" android:exported="false" android:foregroundServiceType="dataSync"/>'
 if "ReceiveService" not in x:
     x = x.replace("</application>", f"    {svc}\n    </application>", 1)
+
+# Phone <-> phone over USB (UsbBridge.kt, Android Open Accessory). Neither role is
+# required, so the app still installs on devices without USB host or accessory support.
+for feat in ("android.hardware.usb.host", "android.hardware.usb.accessory"):
+    if feat not in x:
+        x = re.sub(r"(\s*)<application", lambda mm: f'\n    <uses-feature android:name="{feat}" android:required="false"/>' + mm.group(0), x, count=1)
+# When the other phone switches this one into accessory mode, the system opens the app
+# (and grants the accessory permission) through this filter.
+if "USB_ACCESSORY_ATTACHED" not in x:
+    acc = ('\n            <intent-filter>\n'
+           '                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"/>\n'
+           '            </intent-filter>\n'
+           '            <meta-data android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"\n'
+           '                android:resource="@xml/cablesend_accessory_filter"/>')
+    x, k = re.subn(r'(<activity\b[^>]*android:name="\.MainActivity"[^>]*>)', lambda mm: mm.group(1) + acc, x, count=1)
+    if not k:
+        sys.exit("MainActivity <activity> not found in the manifest")
+xml_dir = os.path.join(app, "android/app/src/main/res/xml")
+os.makedirs(xml_dir, exist_ok=True)
+open(os.path.join(xml_dir, "cablesend_accessory_filter.xml"), "w", encoding="utf-8").write(
+    '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+    '    <usb-accessory manufacturer="CableSend" model="CableSend"/>\n</resources>\n')
 open(manifest, "w", encoding="utf-8").write(x)
 
 # Plugins pin their own compileSdk (file_picker 8: 34, older desktop_drop: 33), while the

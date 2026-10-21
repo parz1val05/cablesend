@@ -11,6 +11,8 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // phone <-> phone over a USB cable; runs for the whole process, not only while receiving
+        UsbBridge.start(applicationContext)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cablesend/service")
             .setMethodCallHandler { call, result ->
                 val text = call.argument<String>("text") ?: "Приём файлов включён"
@@ -32,6 +34,17 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    // The other phone switched us into accessory mode and the system opened the app for it.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        UsbBridge.poke()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        UsbBridge.poke()
     }
 
     private fun askNotificationPermission() {

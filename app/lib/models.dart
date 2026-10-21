@@ -13,6 +13,10 @@ enum CableKind {
   /// A phone reaching the computer it is plugged into, through the `adb reverse`
   /// tunnel. Address: `host:port` on the phone's own loopback.
   usbHost,
+
+  /// An Android phone reaching another Android phone on the same USB cable, through
+  /// the Android Open Accessory bridge (`UsbBridge.kt`). Address: `host:port` on loopback.
+  usbPhone,
 }
 
 String cableTitle(CableKind k) => switch (k) {
@@ -20,6 +24,7 @@ String cableTitle(CableKind k) => switch (k) {
       CableKind.android => 'Android по USB',
       CableKind.ios => 'iPhone / iPad по USB',
       CableKind.usbHost => 'Компьютер по USB',
+      CableKind.usbPhone => 'Телефон по USB',
     };
 
 String cableShort(CableKind k) => switch (k) {
@@ -27,6 +32,7 @@ String cableShort(CableKind k) => switch (k) {
       CableKind.android => 'по USB (Android)',
       CableKind.ios => 'по USB (iPhone)',
       CableKind.usbHost => 'по USB-кабелю',
+      CableKind.usbPhone => 'по USB-кабелю (телефон)',
     };
 
 class Peer {

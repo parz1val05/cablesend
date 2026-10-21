@@ -117,8 +117,29 @@ class CablesPage extends StatelessWidget {
     final r = c.scanResult;
     final net = r.count(CableKind.network);
     final host = r.count(CableKind.usbHost);
+    final phone = r.count(CableKind.usbPhone);
 
     return [
+      if (Platform.isAndroid)
+        _CableCard(
+          kind: CableKind.usbPhone,
+          status: phone > 0
+              ? (StatusKind.ok, 'Телефон подключён')
+              : (StatusKind.none, 'Телефон не найден'),
+          scanning: c.scanning,
+          onCheck: () => unawaited(c.scan()),
+          intro: 'Два Android-телефона соединяются напрямую одним кабелем USB-C — USB-C '
+              '(или через OTG-переходник). Отладка по USB и компьютер не нужны.',
+          sections: const [
+            ('1. Откройте CableSend на обоих', 'Соедините телефоны кабелем. На каждом может появиться '
+                'запрос доступа к USB-устройству — нажмите «OK» (лучше с галочкой «Всегда»).'),
+            ('2. Включите приём на получателе', 'На телефоне, который принимает файлы, включите '
+                '«Принимать файлы». Только тогда отправитель его увидит.'),
+            ('Если телефон не находится', 'Один из телефонов должен стать «главным» по USB. Опустите '
+                'шторку → уведомление о USB → «USB управляет: это устройство» — на отправителе или '
+                'на получателе, неважно. С OTG-переходником главный — тот, в который он вставлен.'),
+          ],
+        ),
       _CableCard(
         kind: CableKind.usbHost,
         status: host > 0
@@ -187,8 +208,9 @@ class CablesPage extends StatelessWidget {
           ]),
           const SizedBox(height: 8),
           Text(
-            'Два телефона одним USB-кабелем напрямую не соединить: iPhone и Android этого не позволяют. '
-            'Варианты: подключите оба к компьютеру или используйте USB-Ethernet адаптеры и сетевой кабель.',
+            'Два Android-телефона соединяются одним USB-кабелем напрямую (карточка «Телефон по USB»). '
+            'iPhone так не умеет: для него подключите оба устройства к компьютеру или используйте '
+            'USB-Ethernet адаптеры и сетевой кабель.',
             style: TextStyle(color: cs.onTertiaryContainer),
           ),
         ]),

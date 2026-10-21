@@ -13,6 +13,7 @@ IconData cableIcon(CableKind k) => switch (k) {
       CableKind.android => Icons.android,
       CableKind.ios => Icons.cable,
       CableKind.usbHost => Icons.usb,
+      CableKind.usbPhone => Icons.smartphone,
     };
 
 IconData platformIcon(String platform) => switch (platform) {

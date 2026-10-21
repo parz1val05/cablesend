@@ -1,0 +1,381 @@
+package __PKG__
+
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
+import android.hardware.usb.UsbManager
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.util.Log
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+
+/**
+ * Phone <-> phone over one USB cable, through Android Open Accessory (AOA).
+ *
+ * The phone that ends up as USB host switches the other one into accessory mode;
+ * after that there is one bulk byte pipe between them. On top of it this bridge
+ * carries plain TCP sessions, so the Rust core does not know about USB at all:
+ *
+ *   sender core -> 127.0.0.1:53321 (this bridge) == USB == other bridge -> 127.0.0.1:53317 (receiver core)
+ *
+ * Both directions work at once: a session opened by the host side travels on
+ * channel 0, one opened by the accessory side on channel 1.
+ *
+ * Frame on the pipe: type u8, channel u8, session u8, length u16 BE, payload.
+ * The session byte lets a late CLOSE of an old session be told apart from a new one.
+ */
+object UsbBridge {
+    private const val TAG = "CableSendUsb"
+    const val LOCAL_PORT = 53321      // senders connect here
+    private const val RECEIVER_PORT = 53317
+
+    private const val OPEN = 1
+    private const val DATA = 2
+    private const val CLOSE = 3
+    private const val HEADER = 5
+    private const val BUF = 16384     // accessory reads must be at least 16 KB
+    private const val MAX_PAYLOAD = BUF - HEADER
+
+    private const val AOA_MANUFACTURER = "CableSend"
+    private const val AOA_MODEL = "CableSend"
+    private const val GOOGLE_VID = 0x18D1
+    private val AOA_PIDS = 0x2D00..0x2D05
+    private const val ACTION_PERMISSION = "com.cablesend.USB_PERMISSION"
+
+    @Volatile private var started = false
+    private lateinit var app: Context
+    private lateinit var usb: UsbManager
+
+    @Volatile private var link: Link? = null
+    private val asked = HashSet<String>()
+
+    fun start(ctx: Context) {
+        synchronized(this) {
+            if (started) return
+            started = true
+        }
+        app = ctx.applicationContext
+        usb = app.getSystemService(Context.USB_SERVICE) as UsbManager
+        thread("usb-server") { serve() }
+        thread("usb-watch") { watch() }
+    }
+
+    /** Called when the activity is (re)opened by an accessory intent: look right away. */
+    fun poke() {
+        if (started && link == null) thread("usb-poke") { tryConnect() }
+    }
+
+    // ------------------------------------------------------------ USB link discovery
+
+    private fun watch() {
+        while (true) {
+            if (link == null) {
+                try { tryConnect() } catch (e: Exception) { Log.w(TAG, "connect: $e") }
+            }
+            Thread.sleep(2000)
+        }
+    }
+
+    @Synchronized
+    private fun tryConnect() {
+        if (link != null) return
+        // Accessory side: the other phone already switched us.
+        usb.accessoryList?.firstOrNull { it.manufacturer == AOA_MANUFACTURER && it.model == AOA_MODEL }?.let { acc ->
+            if (!usb.hasPermission(acc)) {
+                askOnce("acc:${acc.serial}") { usb.requestPermission(acc, permissionIntent()) }
+                return
+            }
+            openAccessory(acc)
+            return
+        }
+        // Host side: a phone plugged into us.
+        for (dev in usb.deviceList.values) {
+            if (!looksLikePhone(dev)) continue
+            if (!usb.hasPermission(dev)) {
+                askOnce("dev:${dev.vendorId}:${dev.productId}:${dev.deviceName}") { usb.requestPermission(dev, permissionIntent()) }
+                continue
+            }
+            if (dev.vendorId == GOOGLE_VID && dev.productId in AOA_PIDS) {
+                openHost(dev)
+                return
+            }
+            switchToAccessory(dev) // it re-enumerates as 18d1:2d0x; the next pass opens it
+        }
+    }
+
+    private fun looksLikePhone(d: UsbDevice): Boolean {
+        if (d.vendorId == GOOGLE_VID && d.productId in AOA_PIDS) return true
+        // skip things that are certainly not a phone: hubs, keyboards/mice, flash drives, audio
+        for (i in 0 until d.interfaceCount) {
+            when (d.getInterface(i).interfaceClass) {
+                UsbConstants.USB_CLASS_HUB, UsbConstants.USB_CLASS_HID,
+                UsbConstants.USB_CLASS_MASS_STORAGE, UsbConstants.USB_CLASS_AUDIO -> return false
+            }
+        }
+        return true
+    }
+
+    private fun askOnce(key: String, ask: () -> Unit) {
+        synchronized(asked) { if (!asked.add(key)) return }
+        try { ask() } catch (e: Exception) { Log.w(TAG, "permission: $e") }
+    }
+
+    private fun permissionIntent(): PendingIntent {
+        val i = Intent(ACTION_PERMISSION).setPackage(app.packageName)
+        val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+        return PendingIntent.getBroadcast(app, 0, i, flags)
+    }
+
+    /** AOA handshake: protocol version, identification strings, start. */
+    private fun switchToAccessory(dev: UsbDevice) {
+        val c = usb.openDevice(dev) ?: return
+        try {
+            val ver = ByteArray(2)
+            val r = c.controlTransfer(0xC0, 51, 0, 0, ver, 2, 1000)
+            if (r < 2 || (ver[0].toInt() or (ver[1].toInt() shl 8)) < 1) return // no AOA support
+            val strings = listOf(AOA_MANUFACTURER, AOA_MODEL, "CableSend file transfer", "1", "https://github.com", "cablesend")
+            for ((idx, s) in strings.withIndex()) {
+                val b = (s + "\u0000").toByteArray(Charsets.UTF_8)
+                c.controlTransfer(0x40, 52, 0, idx, b, b.size, 1000)
+            }
+            c.controlTransfer(0x40, 53, 0, 0, null, 0, 1000)
+            Log.i(TAG, "asked ${dev.deviceName} to switch to accessory mode")
+        } finally {
+            c.close()
+        }
+    }
+
+    private fun openAccessory(acc: UsbAccessory) {
+        val pfd = usb.openAccessory(acc) ?: return
+        val fd = pfd.fileDescriptor
+        start(Link(isHost = false, input = FileInputStream(fd), output = FileOutputStream(fd), closer = { pfd.close() }))
+    }
+
+    private fun openHost(dev: UsbDevice) {
+        val c = usb.openDevice(dev) ?: return
+        val intf = (0 until dev.interfaceCount).map { dev.getInterface(it) }.firstOrNull { i ->
+            (0 until i.endpointCount).any { i.getEndpoint(it).let { e -> e.type == UsbConstants.USB_ENDPOINT_XFER_BULK && e.direction == UsbConstants.USB_DIR_IN } } &&
+                (0 until i.endpointCount).any { i.getEndpoint(it).let { e -> e.type == UsbConstants.USB_ENDPOINT_XFER_BULK && e.direction == UsbConstants.USB_DIR_OUT } }
+        }
+        if (intf == null || !c.claimInterface(intf, true)) { c.close(); return }
+        val eps = (0 until intf.endpointCount).map { intf.getEndpoint(it) }.filter { it.type == UsbConstants.USB_ENDPOINT_XFER_BULK }
+        val epIn = eps.first { it.direction == UsbConstants.USB_DIR_IN }
+        val epOut = eps.first { it.direction == UsbConstants.USB_DIR_OUT }
+        start(Link(isHost = true, input = BulkIn(c, epIn), output = BulkOut(c, epOut), closer = { c.releaseInterface(intf); c.close() }))
+    }
+
+    private fun start(l: Link) {
+        link = l
+        Log.i(TAG, "USB link up (${if (l.isHost) "host" else "accessory"})")
+        thread("usb-reader") { l.readLoop() }
+    }
+
+    private class BulkIn(val c: UsbDeviceConnection, val ep: UsbEndpoint) : InputStream() {
+        override fun read(): Int = throw UnsupportedOperationException()
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val n = c.bulkTransfer(ep, b, off, len, 0)
+            if (n < 0) throw IOException("USB read failed (cable unplugged?)")
+            return n
+        }
+    }
+
+    private class BulkOut(val c: UsbDeviceConnection, val ep: UsbEndpoint) : OutputStream() {
+        override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            var o = off
+            while (o < off + len) {
+                val n = c.bulkTransfer(ep, b, o, off + len - o, 5000)
+                if (n < 0) throw IOException("USB write failed (cable unplugged?)")
+                o += n
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ local TCP side
+
+    private fun serve() {
+        val server = try {
+            ServerSocket().apply {
+                reuseAddress = true
+                bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), LOCAL_PORT))
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "cannot listen on $LOCAL_PORT: $e"); return
+        }
+        while (true) {
+            val s = try { server.accept() } catch (e: IOException) { continue }
+            val l = link
+            if (l == null) { s.close(); continue } // no phone on the cable: refuse, the scan shows nothing
+            l.openOutgoing(s)
+        }
+    }
+
+    private class Session(val chan: Int, val sid: Int, val socket: Socket) {
+        @Volatile var closedByPeer = false
+    }
+
+    private class Link(
+        val isHost: Boolean,
+        val input: InputStream,
+        val output: OutputStream,
+        val closer: () -> Unit,
+    ) {
+        private val myChan = if (isHost) 0 else 1
+        private val sessions = arrayOfNulls<Session>(2)
+        private var nextSid = 0
+        @Volatile private var dead = false
+
+        fun openOutgoing(s: Socket) {
+            val sess: Session
+            synchronized(this) {
+                if (dead || sessions[myChan] != null) { s.close(); return } // one outgoing transfer at a time
+                nextSid = (nextSid + 1) and 0xFF
+                sess = Session(myChan, nextSid, s)
+                sessions[myChan] = sess
+            }
+            try {
+                send(OPEN, sess.chan, sess.sid, ByteArray(0), 0, 0)
+            } catch (e: IOException) {
+                fail(e); return
+            }
+            thread("usb-pump-out") { pump(sess) }
+        }
+
+        /** Local socket -> USB, until the socket ends. */
+        private fun pump(sess: Session) {
+            val buf = ByteArray(MAX_PAYLOAD)
+            try {
+                val inp = sess.socket.getInputStream()
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    sendData(sess, buf, n)
+                }
+            } catch (_: IOException) {
+            }
+            finish(sess, tellPeer = !sess.closedByPeer)
+        }
+
+        private fun sendData(sess: Session, buf: ByteArray, n: Int) {
+            var off = 0
+            while (off < n) {
+                var chunk = minOf(n - off, MAX_PAYLOAD)
+                // A transfer that is an exact multiple of the packet size has no short
+                // packet to end it, and the reader on the other side would wait for more.
+                if ((chunk + HEADER) % 512 == 0) chunk -= 1
+                send(DATA, sess.chan, sess.sid, buf, off, chunk)
+                off += chunk
+            }
+        }
+
+        private fun finish(sess: Session, tellPeer: Boolean) {
+            synchronized(this) { if (sessions[sess.chan] === sess) sessions[sess.chan] = null }
+            try { sess.socket.close() } catch (_: IOException) {}
+            if (tellPeer && !dead) {
+                try { send(CLOSE, sess.chan, sess.sid, ByteArray(0), 0, 0) } catch (e: IOException) { fail(e) }
+            }
+        }
+
+        private val header = ByteArray(HEADER)
+        private val frame = ByteArray(HEADER + MAX_PAYLOAD)
+
+        // Own lock: a USB write can block for a long time, and it must never hold up the
+        // reader thread, which needs the session table to drain the other direction.
+        private val writeLock = Any()
+
+        private fun send(type: Int, chan: Int, sid: Int, data: ByteArray, off: Int, len: Int) = synchronized(writeLock) {
+            frame[0] = type.toByte(); frame[1] = chan.toByte(); frame[2] = sid.toByte()
+            frame[3] = (len shr 8).toByte(); frame[4] = len.toByte()
+            System.arraycopy(data, off, frame, HEADER, len)
+            output.write(frame, 0, HEADER + len)
+            output.flush()
+        }
+
+        /** USB -> local sockets. Everything arrives here, for both channels. */
+        fun readLoop() {
+            val acc = ByteArray(BUF * 4)
+            var have = 0
+            val rd = ByteArray(BUF)
+            try {
+                while (true) {
+                    val n = input.read(rd, 0, BUF)
+                    if (n < 0) throw IOException("USB closed")
+                    if (have + n > acc.size) throw IOException("bridge frame overflow")
+                    System.arraycopy(rd, 0, acc, have, n)
+                    have += n
+                    var p = 0
+                    while (have - p >= HEADER) {
+                        val len = ((acc[p + 3].toInt() and 0xFF) shl 8) or (acc[p + 4].toInt() and 0xFF)
+                        if (have - p < HEADER + len) break
+                        handle(acc[p].toInt(), acc[p + 1].toInt() and 1, acc[p + 2].toInt() and 0xFF, acc, p + HEADER, len)
+                        p += HEADER + len
+                    }
+                    System.arraycopy(acc, p, acc, 0, have - p)
+                    have -= p
+                }
+            } catch (e: IOException) {
+                fail(e)
+            }
+        }
+
+        private fun handle(type: Int, chan: Int, sid: Int, b: ByteArray, off: Int, len: Int) {
+            when (type) {
+                OPEN -> {
+                    if (chan == myChan) return // only the other side opens on its channel
+                    synchronized(this) { sessions[chan] }?.let { finish(it, tellPeer = false) }
+                    val s = try {
+                        Socket().apply { connect(InetSocketAddress("127.0.0.1", RECEIVER_PORT), 2000); tcpNoDelay = true }
+                    } catch (e: IOException) {
+                        // receiving is off on this phone: tell the sender's bridge to hang up
+                        send(CLOSE, chan, sid, ByteArray(0), 0, 0); return
+                    }
+                    val sess = Session(chan, sid, s)
+                    synchronized(this) { sessions[chan] = sess }
+                    thread("usb-pump-in") { pump(sess) }
+                }
+                DATA -> {
+                    val sess = synchronized(this) { sessions[chan] }?.takeIf { it.sid == sid } ?: return
+                    try {
+                        sess.socket.getOutputStream().write(b, off, len)
+                    } catch (_: IOException) {
+                        finish(sess, tellPeer = true)
+                    }
+                }
+                CLOSE -> {
+                    val sess = synchronized(this) { sessions[chan] }?.takeIf { it.sid == sid } ?: return
+                    sess.closedByPeer = true
+                    // Half-close only: the local core still reads what was already written,
+                    // then closes its end, and the pump thread finishes the session.
+                    try { sess.socket.shutdownOutput() } catch (_: IOException) {}
+                }
+            }
+        }
+
+        fun fail(e: Exception) {
+            synchronized(this) { if (dead) return; dead = true }
+            Log.i(TAG, "USB link down: $e")
+            for (s in sessions) s?.let { try { it.socket.close() } catch (_: IOException) {} }
+            try { closer() } catch (_: Exception) {}
+            if (link === this) link = null
+        }
+    }
+
+    private fun thread(name: String, body: () -> Unit) {
+        Thread({
+            try { body() } catch (e: Exception) { Log.w(TAG, "$name: $e") }
+        }, name).apply { isDaemon = true }.start()
+    }
+}

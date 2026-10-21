@@ -241,6 +241,7 @@ class CliBackend implements Backend {
     switch (peer.kind) {
       case CableKind.network:
       case CableKind.usbHost:
+      case CableKind.usbPhone:
         args.addAll(['--to', peer.address]);
       case CableKind.android:
         args.addAll(['--adb', peer.address, '--remote-port', '53317']);

@@ -91,7 +91,8 @@ pub unsafe extern "C" fn cs_free_string(p: *mut c_char) {
     if !p.is_null() { drop(CString::from_raw(p)); }
 }
 
-/// Look for peers (UDP beacon on cable links + the `adb reverse` tunnel). Result arrives as a `scan` event.
+/// Look for peers (UDP beacon on cable links, the `adb reverse` tunnel to a PC, and the
+/// USB bridge to another phone). Result arrives as a `scan` event.
 #[no_mangle]
 pub extern "C" fn cs_scan(beacon_port: u16) {
     spawn_guarded("out", move || {
@@ -102,23 +103,32 @@ pub extern "C" fn cs_scan(beacon_port: u16) {
                 items.push(format!("{{\"id\":\"{}\",\"name\":\"{}\",\"platform\":\"{}\",\"addr\":\"{}\",\"via\":\"net\"}}", esc(&f.id), esc(&f.name), esc(&f.platform), f.addr));
             }
         }
-        if usb_tunnel_alive() {
+        if probe_receiver(transport::PHONE_TO_PC_PORT).is_some() {
             let addr = format!("127.0.0.1:{}", transport::PHONE_TO_PC_PORT);
             items.push(format!("{{\"id\":\"usb-host\",\"name\":\"Компьютер\",\"platform\":\"desktop\",\"addr\":\"{addr}\",\"via\":\"usb\"}}"));
+        }
+        // Only answers when another phone is on the cable AND has receiving switched on.
+        if let Some(p) = probe_receiver(transport::PHONE_TO_PHONE_PORT) {
+            let addr = format!("127.0.0.1:{}", transport::PHONE_TO_PHONE_PORT);
+            items.push(format!("{{\"id\":\"usb-phone\",\"name\":\"{}\",\"platform\":\"{}\",\"addr\":\"{addr}\",\"via\":\"usb\"}}", esc(&p.name), esc(&p.platform)));
         }
         push(format!("{{\"event\":\"scan\",\"peers\":[{}]}}", items.join(",")));
     });
 }
 
-/// `adb reverse` accepts connections even when nobody listens on the PC, then closes them.
-/// A live PC receiver stays silent waiting for our HELLO, so "read times out" means "alive".
-fn usb_tunnel_alive() -> bool {
-    let addr: SocketAddr = ([127, 0, 0, 1], transport::PHONE_TO_PC_PORT).into();
-    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else { return false };
-    s.set_read_timeout(Some(Duration::from_millis(350))).ok();
-    let mut b = [0u8; 1];
-    use std::io::Read;
-    matches!(s.read(&mut b), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+/// Is a receiver reachable through a local tunnel port, and who is it?
+///
+/// `adb reverse` (and the USB bridge when the other phone is not receiving) accepts the
+/// connection even when nobody is behind it, then closes it. A live receiver greets every
+/// connection with its HELLO frame straight away (`proto::hello` writes before it reads),
+/// so "a HELLO arrived" means "alive". The receiver then sees us leave before an OFFER
+/// and treats it as a probe.
+fn probe_receiver(port: u16) -> Option<crate::proto::Peer> {
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    s.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+    let f = crate::proto::read_frame(&mut s).ok()?;
+    (f.len() >= 4 && f[0] == "HELLO").then(|| crate::proto::Peer { name: f[2].clone(), platform: f[3].clone() })
 }
 
 /// Start receiving. Returns the bound port (>0), -1 if already running, -2 if the port is unavailable.
@@ -204,4 +214,33 @@ pub unsafe extern "C" fn cs_send(to: *const c_char, name: *const c_char, files: 
             Err(e) => push(format!("{{\"event\":\"error\",\"dir\":\"out\",\"message\":\"{}\"}}", esc(&e.to_string()))),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_receiver;
+    use std::net::TcpListener;
+
+    #[test]
+    fn probe_sees_a_live_receiver() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            // a real receiver: greets first, then sees the probe leave
+            let _ = crate::proto::hello(&mut s, "rx");
+        });
+        assert_eq!(probe_receiver(port).map(|p| p.name).as_deref(), Some("rx"));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn probe_rejects_a_tunnel_with_nobody_behind_it() {
+        // what `adb reverse` does when no PC receiver runs: accept, then close
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || drop(l.accept().unwrap()));
+        assert!(probe_receiver(port).is_none());
+        t.join().unwrap();
+    }
 }

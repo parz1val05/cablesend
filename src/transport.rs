@@ -124,6 +124,10 @@ pub fn adb_connect(serial: Option<&str>, remote_port: u16) -> io::Result<AdbStre
 /// Differs from the phone's own receive port (53317) so the two never collide.
 pub const PHONE_TO_PC_PORT: u16 = 53320;
 
+/// Port on a PHONE where its USB bridge (Android Open Accessory, `UsbBridge.kt`) leads to
+/// the receiver of the other phone on the same cable.
+pub const PHONE_TO_PHONE_PORT: u16 = 53321;
+
 /// Phone -> PC: make the phone's `127.0.0.1:phone_port` reach the PC's `pc_port`.
 pub fn adb_reverse(serial: Option<&str>, phone_port: u16, pc_port: u16) -> io::Result<()> {
     adb(serial, &["reverse", &format!("tcp:{phone_port}"), &format!("tcp:{pc_port}")]).map(|_| ())

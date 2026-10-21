@@ -25,7 +25,7 @@ flutter analyze --no-fatal-infos
 CABLESEND_BIN=<path to cablesend(.exe)> flutter run -d windows     # without the core binary the app starts in demo mode
 ```
 
-Android: `tools/build_android.sh` (cargo-ndk → `jniLibs/<abi>/libcablesend.so`), then `tools/apply_android.sh app` (idempotently patches manifest, `ReceiveService`, `MainActivity` from `app/native/android/*.kt.tmpl`). iOS: `tools/build_ios.sh` on a Mac, then manual Xcode steps in `NATIVE.md`.
+Android: `tools/build_android.sh` (cargo-ndk → `jniLibs/<abi>/libcablesend.so`), then `tools/apply_android.sh app` (idempotently patches manifest, `ReceiveService`, `MainActivity`, `UsbBridge`, the accessory intent filter, the compileSdk floor from `app/native/android/*.kt.tmpl`). iOS: `tools/build_ios.sh` on a Mac, then manual Xcode steps in `NATIVE.md`.
 
 CI (`.github/workflows/build.yml`) is the only place the Dart code and the APK/Windows builds are actually compiled: `check` (Rust tests + `flutter analyze`) → `android` / `windows` artifacts.
 
@@ -39,7 +39,11 @@ CI (`.github/workflows/build.yml`) is the only place the Dart code and the APK/W
 - `sha256.rs`, `json.rs` — hand-rolled because of the no-dependencies rule.
 - `main.rs` — CLI (`receive`, `send`, `peers`, `devices`, `--json` event output). `ffi.rs` — C ABI (`cs_*`, 8 functions on C strings, no callbacks; events pulled via `cs_next_event`). Incoming connections are handled one at a time, so `cs_answer` has no transfer id.
 
-Ports: **53317** TCP receive, **53318** UDP beacon, **53320** phone→PC tunnel (`receive --adb-reverse`).
+Ports: **53317** TCP receive, **53318** UDP beacon, **53320** phone→PC tunnel (`receive --adb-reverse`), **53321** phone→phone USB bridge.
+
+USB peers are found by `ffi.rs::probe_receiver`: connect to the tunnel port and wait for the receiver's HELLO, which every receiver sends first. A tunnel with nobody behind it accepts and closes, so silence or EOF means "not there".
+
+**Phone ↔ phone over one USB cable** (`app/native/android/UsbBridge.kt.tmpl`, Android only): Android Open Accessory. The phone that is USB host switches the other into accessory mode (manufacturer/model `CableSend`), then the bridge carries TCP sessions over the bulk pipe: a sender connects to `127.0.0.1:53321`, the other phone's bridge connects to its own receiver on `127.0.0.1:53317`. Frames: type, channel (0 = opened by host side, 1 = by accessory side), session id, u16 length. The Rust core is unaware of USB here. Untested on real phones.
 
 **App (`app/lib/`).** `AppController` (ChangeNotifier) talks to the abstract `Backend` (`backend/backend.dart`), which has three implementations that must emit identical `BackendEvent`/`Peer`:
 - `CliBackend` (desktop) — spawns `cablesend … --json` and parses lines. `receive` and `peers` are separate processes, so it passes them the same `--id` (`_instanceId`); otherwise the PC discovers itself.
