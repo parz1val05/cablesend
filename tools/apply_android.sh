@@ -51,5 +51,40 @@ svc = f'<service android:name="{pkg}.ReceiveService" android:exported="false" an
 if "ReceiveService" not in x:
     x = x.replace("</application>", f"    {svc}\n    </application>", 1)
 open(manifest, "w", encoding="utf-8").write(x)
-print(f"OK: package {pkg}; manifest and Kotlin files updated")
+
+# Plugins pin their own compileSdk (file_picker 8: 34, older desktop_drop: 33), while the
+# AndroidX libraries they pull in require 36, so checkReleaseAarMetadata fails. Raise every
+# Android subproject to at least 36. The hook must be registered before the template's
+# `evaluationDependsOn(":app")` block, otherwise :app is already evaluated and afterEvaluate throws.
+MIN_SDK = 36
+marker = "cablesend: compileSdk floor"
+for name, block in (
+    ("build.gradle.kts",
+     f"// {marker}\n"
+     "subprojects {\n"
+     "    afterEvaluate {\n"
+     '        val android = extensions.findByName("android") ?: return@afterEvaluate\n'
+     '        val sdk = (org.codehaus.groovy.runtime.InvokerHelper.getProperty(android, "compileSdk") as Int?) ?: 0\n'
+     f"        if (sdk < {MIN_SDK}) org.codehaus.groovy.runtime.InvokerHelper.setProperty(android, \"compileSdk\", {MIN_SDK})\n"
+     "    }\n"
+     "}\n"),
+    ("build.gradle",
+     f"// {marker}\n"
+     "subprojects {\n"
+     "    afterEvaluate { p ->\n"
+     f"        if (p.extensions.findByName('android') && (p.android.compileSdk ?: 0) < {MIN_SDK}) p.android.compileSdk = {MIN_SDK}\n"
+     "    }\n"
+     "}\n"),
+):
+    path = os.path.join(app, "android", name)
+    if not os.path.isfile(path):
+        continue
+    g = open(path, encoding="utf-8").read()
+    if marker not in g:
+        m2 = re.search(r"^subprojects\s*\{\s*\n\s*project\.evaluationDependsOn", g, re.M)
+        g = g[:m2.start()] + block + "\n" + g[m2.start():] if m2 else g.rstrip("\n") + "\n\n" + block
+        open(path, "w", encoding="utf-8").write(g)
+    break
+
+print(f"OK: package {pkg}; manifest, Kotlin files and compileSdk floor updated")
 PY
