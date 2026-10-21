@@ -8,7 +8,7 @@
   компьютеру и USB-Ethernet.
 
 ## Запуск на компьютере
-Нужен Flutter 3.47.7 или новее: этого требует `desktop_drop` 0.9 (более старые версии плагина не собираются под Android).
+Нужен Flutter 3.27 или новее (на 3.24 не соберётся: используется `CardThemeData`).
 ```
 cd app
 flutter create --platforms=windows,macos,linux,android,ios --project-name cablesend_app .   # создаст папки платформ, lib/ не трогает

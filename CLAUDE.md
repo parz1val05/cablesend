@@ -15,7 +15,7 @@ python tools/ffi_smoketest.py <tmpdir> # C ABI check via ctypes; needs `cargo bu
                                        # hardcodes /home/claude/.../libcablesend.so — fix the path
 ```
 
-Flutter app (`app/`, needs Flutter >= 3.47.7 because `desktop_drop` 0.9 requires it; older `desktop_drop` versions fail the Android build with compileSdk 33). Platform folders (`android/`, `windows/`, …) are **not committed**; they are generated:
+Flutter app (`app/`, needs Flutter >= 3.27 because of `CardThemeData`; keep `desktop_drop` >= 0.7 (older ones fail the Android build with compileSdk 33) and < 0.9 (0.9 conflicts with `file_picker` 8 over `cross_file`)). Platform folders (`android/`, `windows/`, …) are **not committed**; they are generated:
 ```
 cd app
 flutter create --platforms=windows,android --project-name cablesend_app --org com.cablesend .
